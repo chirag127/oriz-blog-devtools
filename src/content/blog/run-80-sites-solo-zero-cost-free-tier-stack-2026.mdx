@@ -1,0 +1,501 @@
+---
+title: "How I run 80+ sites solo for ₹0: the exact free-tier stack (2026)"
+description: "The real Cloudflare + Astro + GitHub Actions + keyless-AI stack one solo dev uses to build and run 80+ live sites, tools, and APIs at zero monthly cost — and exactly where the free tiers bite."
+pubDate: 2026-08-13
+category: "Hosting"
+tags: ["cloudflare", "astro", "free-tier", "solo-developer", "static-sites", "github-actions", "self-hosting"]
+author: "Chirag Singhal"
+---
+
+I run more than eighty live sites. Blogs, tools, data dashboards, small APIs, a
+few PWAs. They are on real domains, they serve real traffic, they update
+themselves on a schedule, and some of them talk to a language model. My monthly
+bill for all of it — hosting, build minutes, DNS, TLS, and AI inference — is
+zero rupees.
+
+That is not a trick and it is not a stunt. It is a deliberate architecture built
+around one observation: in 2026, the free tiers of a handful of infrastructure
+providers are genuinely large enough to carry a portfolio of static-first sites,
+as long as you design *for* those free tiers instead of fighting them. This post
+is the exact stack, layer by layer, with the real limits, the honest places
+where those limits bite, and a playbook you can copy.
+
+One warning up front, and I mean it: **every quota in this post is a moving
+target.** These numbers were verified against each provider's own official
+documentation, but free tiers change without notice — providers tighten them,
+rename them, or replace a countable limit with an opaque "credits" model. Treat
+every number here as time-sensitive. Before you build anything load-bearing on a
+quota, open the provider's docs and re-verify it yourself. I flag the specific
+ones that have already shifted.
+
+## The "family of products" model, and why ₹0 is achievable now
+
+Most people picture a solo developer's infrastructure as one big app on one
+server. That mental model is what makes hosting expensive. A single always-on
+server that can do anything costs money every hour it exists, whether or not
+anyone visits.
+
+I do the opposite. I treat my sites as a **family of products** — many small,
+mostly independent things that share code but not runtime. Each one is a
+static-first site: pre-built into plain files, served from the edge, doing
+almost nothing at request time. When a site needs to be dynamic, it does the
+dynamic part in a tiny function that only runs when called, or it pushes the work
+*off* the request path entirely — onto a scheduled job that runs somewhere else
+and commits the result back as data.
+
+That shape is what unlocks ₹0. You are not paying for idle capacity, because
+there is no idle capacity to pay for. Static files cost effectively nothing to
+serve; edge functions cost nothing until they run; scheduled jobs run on free
+CI minutes. Add it up across eighty sites and the total is still inside the free
+tier, because eighty static sites doing nothing at rest sum to roughly nothing.
+
+Before I go further, let me define the jargon, because the whole argument rests
+on these five ideas:
+
+- **Static site.** A site pre-rendered into finished HTML, CSS, and JavaScript
+  files at *build time* — before anyone visits. The server does no work per
+  request; it just hands over files. Cheap to host, fast to serve, hard to break.
+- **Edge / Workers.** Code that runs on servers physically close to the visitor,
+  spun up on demand for a single request and torn down after. You pay per
+  request (or, on a free tier, per request up to a cap), not per hour. No
+  always-on machine.
+- **Islands.** An architecture where a page is static HTML by default and only
+  small, specific interactive "islands" ship JavaScript and hydrate in the
+  browser. The rest of the page stays inert HTML. Less JS shipped means faster
+  pages and simpler hosting.
+- **Git-as-DB.** Using a Git repository as your database. A scheduled job
+  fetches data, writes it to a JSON or CSV file, and commits it back. The commit
+  history *is* your time-series database — free, versioned, and auditable. Simon
+  Willison named this pattern "git scraping."
+- **Free tier.** The permanent, no-credit-card-required allowance a provider
+  gives away. Not a trial. The whole stack lives here.
+
+Put those together and the architecture writes itself: static sites (cheap to
+host) + edge functions (pay-per-use, free under a cap) + git-as-DB on free CI
+(no database bill) + keyless AI (no inference bill). Eighty times over.
+
+## The stack, layer by layer
+
+Here is the whole thing in one table. Every limit is a 2026 number pulled from
+the provider's own docs; every number is time-sensitive and cited in the Sources
+section at the end.
+
+| Layer | Tool | Free-tier limit (2026, verify) | Why it's here |
+|---|---|---|---|
+| Static hosting | Cloudflare Pages | Unlimited requests & bandwidth; 500 builds/mo; 100 projects/account | Unmetered serving is what makes a big fleet feasible |
+| Edge compute | Cloudflare Workers | 100,000 requests/day; 10 ms CPU/request | Dynamic bits without an always-on server |
+| Site framework | Astro | N/A (open source) | Static-first, zero client JS by default |
+| Interactivity | Preact / React islands | N/A | Ship JS only where a component needs it |
+| DNS + TLS | Cloudflare DNS | Free, unlimited zones; automatic TLS | Every `*.oriz.in` subdomain, free certs |
+| Source + CI | GitHub + Actions | Effectively unlimited minutes on public repos | Git-as-DB + scheduled scrapers |
+| Data pipelines | GitHub Actions cron | Same as above | Scrape → commit JSON → history is the DB |
+| AI inference | g4f.dev (gpt4free) keyless client | No API key, runs in browser | Multi-provider failover, ₹0 AI bill |
+| Shared code | `@chirag127/*` npm packages | Free (public npm) | One mechanism, many distinct site identities |
+| Auth (only where needed) | Clerk | Free tier for SSO | Public surfaces stay auth-free by design |
+| Secrets | sops + age vault, `envpact` | Free (local + git) | Encrypted secrets in git, no secrets SaaS bill |
+
+The philosophy running through every row: **push work to build time or off the
+request path, and only pay-per-use where you truly must be dynamic.** Now let me
+walk each layer.
+
+### Hosting: Cloudflare Pages (the load-bearing wall)
+
+The single most important decision in this stack is that finished sites are
+served as static files from **Cloudflare Pages**, whose free tier gives you
+**unlimited requests and unlimited bandwidth.** That word — unlimited — is what
+makes an eighty-site fleet possible without a metered egress bill hanging over
+you. It is the opposite of a per-gigabyte transfer model, and it is the reason I
+build on Cloudflare first and everything else second.
+
+Pages is not literally unlimited in *every* dimension, though, and the limits
+that do exist are exactly the ones that shape how I work:
+
+- **500 builds per month.** Across the whole account.
+- **1 concurrent build.** Builds queue; they do not run in parallel.
+- **20-minute build timeout** per build.
+- **100 projects per account** — a hard cap that Cloudflare's docs describe as
+  not routinely increased.
+- **100 custom domains per project.**
+
+Read those again with an eighty-site fleet in mind and you can see both why this
+works and where the ceiling is. Unlimited bandwidth means traffic never costs me
+anything. But 500 builds a month across everything, with only one build running
+at a time, means I cannot casually push tiny commits to eighty repos all day —
+I'd blow the build budget and sit in a queue. And **100 projects is my practical
+ceiling.** At eighty-plus sites I am visibly walking toward a wall that does not
+move. That single number is the real constraint on this architecture, more than
+bandwidth or compute ever will be. I cover how I manage all three below.
+
+### Edge compute: Cloudflare Workers (dynamic, on demand)
+
+When a site needs to actually *compute* something per request — a small API, a
+redirect with logic, a form handler, an on-the-fly transform — it runs on a
+**Cloudflare Worker.** The free tier is **100,000 requests per day**, and the
+counter resets at **midnight UTC.** Exceed it and Cloudflare returns **Error
+1027** and stops serving your Worker until the reset. There is no overage
+billing to surprise you; you just get cut off, which is honestly the failure
+mode I prefer for a ₹0 stack.
+
+The other number that matters — and it is the one people miss — is CPU time.
+The free tier gives each request **10 milliseconds of CPU.** Not wall-clock time
+waiting on a network call; CPU time doing actual work. The paid plan raises this
+to 5 minutes, a five-hundred-fold difference. Ten milliseconds is plenty for a
+redirect, a small JSON response, or a lightweight transform. It is *not* enough
+for heavy computation, large template rendering, or anything that loops over a
+big dataset. Design your Workers to be thin. If something needs more than 10 ms
+of CPU, that is a signal it belongs at build time or in a scheduled job, not on
+the request path.
+
+### The framework: Astro, static-first by design
+
+Every site is built with **Astro**, and the reason is philosophical alignment,
+not fashion. Astro renders to **HTML and CSS with zero client-side JavaScript by
+default.** Its islands architecture means the page ships as inert HTML, and only
+the components you explicitly mark to hydrate — with a `client:*` directive —
+send any JavaScript to the browser at all.
+
+This maps *perfectly* onto free static hosting. A framework that produces plain
+files by default is a framework whose output costs nothing to serve. I reach for
+a **Preact or React island** only where a piece of the page genuinely needs to be
+interactive — a search box, a live chart, a theme toggle. Everything else stays
+static. The result is sites that are fast, that score well on Lighthouse without
+heroics, and that fit the unlimited-bandwidth-static-hosting model like a glove.
+
+**A currency shift that bites, and bit me:** the Astro Cloudflare adapter **no
+longer supports Cloudflare Pages** and now directs users toward **Cloudflare
+Workers** instead. If you follow an older tutorial that says "use the Cloudflare
+adapter for Pages," you will hit friction, because that path has been
+deprecated. For purely static output you often need no server adapter at all —
+you just deploy the built files to Pages. But the moment you want server-side
+rendering on Cloudflare, the officially supported target is now Workers, not
+Pages. This is a recent change and it is exactly the kind of thing that makes a
+two-year-old blog post lie to you. Re-verify the adapter's current guidance
+before you wire up SSR.
+
+### DNS and TLS: Cloudflare, free and unlimited
+
+Every site lives on a subdomain of my apex — `something.oriz.in` — with DNS
+managed by **Cloudflare.** DNS is free, zones are unlimited, and **TLS
+certificates are automatic and free.** This is genuinely uninteresting, which is
+the point: HTTPS on every site, on every subdomain, at no cost and with no
+manual certificate management. Free DNS and free TLS are table stakes across all
+the major providers in 2026, so this is not where you differentiate — it's just
+one less bill.
+
+### Source, CI, and the database that is actually just Git
+
+All source lives on **GitHub**, and here is where the stack gets clever.
+**GitHub Actions minutes are effectively unlimited for public repositories.**
+That free, essentially uncapped CI budget is the engine behind two things.
+
+First, **builds and deploys.** Push to a repo, Actions builds the Astro site and
+deploys it. Automated, hands-off.
+
+Second — and this is the part that replaces a database bill — **git scraping.**
+This is Simon Willison's technique, and it is beautiful in its simplicity: a
+scheduled Actions job (a cron) wakes up, fetches some data from an API or a
+webpage, writes it to a JSON file in the repo, and commits it back. Do that
+hourly and **the Git history becomes your time-series database.** Every commit is
+a timestamped snapshot. You get versioning, auditability, and diffs for free, and
+you pay nothing because it runs on free public-repo minutes.
+
+I use this for real data pipelines — tracking a market fear-and-greed index, IPO
+premium data, index signals. No database server, no cron server, no hosting bill.
+The scraper writes JSON; the static site reads that JSON at build time (or the
+browser fetches it directly); the history file *is* the archive. It is the single
+highest-leverage pattern in this whole stack.
+
+### AI without an API key
+
+Several sites do things with a language model — summarizing, classifying,
+rewriting. In a normal architecture that means an LLM API key and a per-token
+bill that scales with usage. I don't pay that bill.
+
+Instead these sites use **gpt4free's `g4f.dev` JavaScript client**, which runs in
+the browser and routes requests through multiple free providers with automatic
+failover — **no LLM API key, no server, ₹0 AI bill.** When one provider is down
+or rate-limited, it falls through to the next. It is not the right choice for
+mission-critical, SLA-backed inference — it is a best-effort, keyless client that
+happens to be free — but for the kind of AI features a small site wants, it is
+exactly enough. The point is that AI inference, the one line item that most
+threatens a ₹0 budget in 2026, stays at zero here.
+
+### Shared code, distinct identities
+
+Eighty sites that all look the same would be a template farm, not a family of
+products. So the code is shared but the *identity* is not. Common mechanism —
+accessibility helpers, theming primitives, layout scaffolding — lives in shared
+**`@chirag127/*` npm packages** that every site pulls in. But each site keeps its
+**own visual identity**: its own palette, type, voice, and personality. Shared
+plumbing, distinct faces. This is what lets one person maintain eighty sites
+without the maintenance load growing linearly — fix a bug in the shared
+accessibility helper once, and every site benefits.
+
+### Auth and secrets, only where needed
+
+Most surfaces are public, and that is a deliberate cost decision: a public static
+page needs no auth, no session store, no user database. Where a site genuinely
+needs sign-in, I use **Clerk's free tier** for SSO — but only there. The default
+is public.
+
+Secrets never touch a paid secrets-management SaaS. They live encrypted in git
+via a **sops + age vault**, managed through a small **`envpact`** tool. Encrypted
+at rest, versioned alongside the code, decrypted only where and when needed. No
+secrets-manager subscription.
+
+## Deep dive: the free-tier limits, and where they honestly bite
+
+A ₹0 stack is only real if you know precisely where the walls are. Here are the
+ones that matter, how I stay inside them, and where they genuinely hurt.
+
+### The 100-project cap on Cloudflare Pages — the real ceiling
+
+**100 projects per account, and Cloudflare's docs say it is not routinely
+increased.** This is the true limit on this architecture. Unlimited bandwidth
+means I never fear traffic; the 100-project cap means I *do* have to think about
+site count. At eighty-plus, I am within sight of it.
+
+How I stay inside it: I do not spin up a new project for every experiment. Small
+related things get folded into an existing site as a route rather than becoming a
+new Pages project. Dead sites get archived and their projects deleted to reclaim
+slots. And when I eventually hit the wall, the escape hatch is a second Cloudflare
+account or moving some static sites to a different host — not a paid upgrade,
+because the cap is a hard architectural limit rather than a billing gate. **Be
+honest with yourself here:** if your ambition is hundreds of independent sites,
+Cloudflare Pages' free tier alone does not get you there. Plan the multi-account
+or multi-host split before you hit 100, not after.
+
+### 500 builds per month, 1 concurrent build, 20-minute timeout
+
+**500 builds a month across the whole account, one at a time, each capped at 20
+minutes.** With eighty sites, undisciplined pushing burns this fast. If I averaged
+even seven or eight builds per site per month I'd be at the ceiling.
+
+How I stay inside it:
+
+- **Batch changes.** I don't push a one-character fix and trigger a build. Changes
+  accumulate and deploy together.
+- **Build locally first.** I run `npm run build` on my machine to catch errors
+  *before* spending a remote build on a failure. A failed remote build still
+  counts against the 500.
+- **Keep builds fast.** Astro's static builds are quick, so the 20-minute timeout
+  is never close for a normal site — but a site with thousands of pages and heavy
+  image processing can approach it. Watch build times as content grows.
+- **Mind the single concurrent build.** Deploy a wave of sites and they queue.
+  For a solo dev this is fine; you are not shipping eighty sites in the same
+  minute. But it does mean a "deploy everything" script is serial, not parallel.
+
+### 100,000 Worker requests/day and 10 ms CPU
+
+**100k requests per day, reset at midnight UTC, Error 1027 on exceed; 10 ms of
+CPU per request.** For a fleet where most sites are pure static (served by Pages,
+which does *not* consume Worker requests), 100k/day is comfortable — Worker
+requests are spent only by the genuinely dynamic bits. The place this bites is if
+you accidentally route static traffic through a Worker, or if one API endpoint
+goes viral. Keep static on Pages, keep Workers thin, and the daily cap is roomy.
+
+The 10 ms CPU limit is the subtler one. It quietly enforces good design: it is
+*impossible* to do something heavy in a free Worker, so you are forced to move
+heavy work to build time or to a scheduled job. I have come to see it as a
+feature. But if you arrive expecting to run a big server-side render or a
+data-crunching loop in a Worker on the free plan, you will hit the wall
+immediately. That is a 500× gap versus the paid plan's 5 minutes — know which
+side of it your workload lives on.
+
+### Cold starts
+
+Edge functions that haven't run recently can have a **cold start** — a small
+latency penalty on the first request while the runtime spins up. Cloudflare
+Workers are notably good here compared to older serverless platforms, but it is
+not zero. For static pages this is a non-issue (Pages serves files, no function
+involved). For a rarely-hit Worker-backed API, the first request after idle may be
+slightly slower. Usually invisible; worth knowing when you benchmark.
+
+### The Astro-adapter-Pages deprecation, again
+
+I'll flag it once more because it is the freshest gotcha: **the Astro Cloudflare
+adapter no longer supports Pages and now points you to Workers.** If you are
+setting up SSR on Cloudflare in 2026, target Workers. If you are serving pure
+static output, you may not need the adapter at all. Following stale documentation
+here wastes an afternoon. Re-verify the adapter's README before wiring it up.
+
+## Provider comparison: Cloudflare vs Vercel vs Netlify vs GitHub Pages
+
+Not every free tier suits a big fleet. Here is the honest 2026 comparison of the
+four hosts I evaluated. Every number is time-sensitive; sources are cited at the
+end.
+
+| Provider | Bandwidth / requests | Builds / deploys | Site / project cap | Function allowance | Fit for an 80-site fleet |
+|---|---|---|---|---|---|
+| **Cloudflare Pages** | Unlimited requests & bandwidth | 500 builds/mo, 1 concurrent, 20-min timeout | 100 projects/account (hard) | Via Workers: 100k req/day, 10 ms CPU | **Best fit** — unmetered serving; 100-project cap is the only ceiling |
+| **Vercel Hobby** | 100 GB Fast Data Transfer/mo (metered) | 100 deploys/day (also 100/hr, 60/5min) | — | 1M function invocations, 4 CPU-hrs, 360 GB-hrs | **Poor fit** — metered bandwidth and deploy caps punish a big fleet |
+| **Netlify Free** | Opaque 300-credit/mo model; no published bandwidth/build/site numbers | Not publicly quantified | Not publicly quantified | Not publicly quantified | **Hard to plan** — free custom domains + SSL, but the credits model makes fleet capacity unpredictable |
+| **GitHub Pages** | Soft bandwidth/usage guidance | Built via Actions | Effectively per-repo | None (static only) | **Fine for pure static**, no functions; good for simple sites, not dynamic ones |
+
+The takeaways, stated plainly:
+
+- **Cloudflare Pages wins for a fleet** because bandwidth is unmetered. On Vercel,
+  100 GB/month of Fast Data Transfer is a *metered* ceiling — reasonable for one
+  or two apps, tight across eighty. Vercel's per-day and per-hour deploy caps (100
+  deploys/day, 100/hour, 60 per 5 minutes) further discourage the many-small-sites
+  pattern. Vercel Hobby is a genuinely good product; it is just not designed for
+  the shape of workload I run.
+- **Netlify moved to an opaque credits model.** As of the pricing page I checked,
+  Netlify's free tier no longer publicly quantifies bandwidth, build minutes, or
+  site count — it is described in terms of a 300-credit monthly allowance. Free
+  custom domains and SSL are included. But I cannot honestly plan an eighty-site
+  fleet around a limit I cannot read off the docs. **I could not verify concrete
+  Netlify build/bandwidth/site numbers**, so I am not going to invent them — and
+  that opacity is itself a reason it is hard to recommend for this use case.
+- **GitHub Pages is fine for pure static sites** and integrates naturally with the
+  git-as-DB workflow, but it has no serverless functions — the moment you need
+  dynamic behavior you are back to Workers anyway. It's a reasonable overflow host
+  for simple static sites if you're pushing against the Cloudflare project cap.
+
+## Build your own zero-cost fleet: the playbook
+
+Here is the concrete, ordered process for standing up your own ₹0 fleet.
+
+### Step 1 — Scaffold many, fast
+
+Build a template Astro project — layout, shared config, deploy workflow, PWA
+manifest, sitemap, RSS — and turn it into your starting point for every new site.
+When you want a new site, you copy the template, change the content and the
+identity, and you have a deployable site in minutes, not hours. The goal is that
+starting site number fifty-one costs you the same effort as starting site number
+two.
+
+### Step 2 — Share code, keep identities distinct
+
+Extract the *mechanism* — accessibility helpers, theming primitives, layout
+scaffolding — into shared npm packages (mine are `@chirag127/*`, published
+publicly and free). Every site depends on them. But give each site its own
+palette, type, voice, and personality. **Shared plumbing, distinct faces.** This
+is the difference between a maintainable family of products and an unmaintainable
+template farm. When you fix a bug in the shared helper, all eighty sites inherit
+the fix.
+
+### Step 3 — Put data pipelines on GitHub Actions cron
+
+For anything that needs fresh data — prices, indices, feeds — write a small
+scraper, schedule it as a GitHub Actions cron on a **public** repo, and have it
+commit the fetched JSON back to the repo. The git history is your database. The
+static site reads the JSON at build time or the browser fetches it live. No
+database, no cron server, no bill. This is git scraping, and it is the pattern
+that makes "dynamic" data live inside a static, free architecture.
+
+### Step 4 — Add AI keylessly, where it earns its place
+
+If a site benefits from a language model, wire in the keyless `g4f.dev` browser
+client with multi-provider failover rather than reaching for a paid API key.
+Reserve it for genuinely useful features; understand it is best-effort, not
+SLA-backed. Your AI bill stays at zero.
+
+### Step 5 — Bake in PWA, Lighthouse, and SEO from the template
+
+Because these are in the template, every new site ships with a PWA manifest, good
+Lighthouse scores (easy when you ship almost no JS), and proper SEO metadata by
+default. Quality is a property of the scaffold, not a per-site chore.
+
+### Step 6 — Automate deploys, and respect the build budget
+
+Wire GitHub Actions to build and deploy on push. Then discipline yourself around
+the **500-builds/month, single-concurrent** reality: batch changes, build locally
+first to catch failures before spending a remote build, and don't push trivial
+commits that each trigger a deploy.
+
+### Step 7 — Monitor 80+ sites without a monitoring bill
+
+At this scale you need to know when something breaks, but you don't need a paid
+observability platform. A scheduled Actions job that pings each site's health
+endpoint and opens an issue (or sends a free notification) on failure is enough.
+Same pattern as git scraping: free CI does the watching. Keep a single list of
+every site, its repo, and its subdomain so the fleet never becomes untracked.
+
+### The checklist
+
+- [ ] Template Astro project ready to copy for a new site in minutes.
+- [ ] Shared `@chirag127/*`-style packages for mechanism; per-site visual
+  identity kept distinct.
+- [ ] Static output → Cloudflare Pages (unmetered bandwidth).
+- [ ] Dynamic bits → thin Cloudflare Workers, under 10 ms CPU, within 100k/day.
+- [ ] Data → GitHub Actions cron, git-as-DB, public repos.
+- [ ] AI → keyless `g4f.dev` client, failover, no key.
+- [ ] DNS + TLS → Cloudflare, free per subdomain.
+- [ ] Auth → Clerk free tier, only where sign-in is truly needed.
+- [ ] Secrets → sops + age vault in git, no secrets SaaS.
+- [ ] Watch the **100-project cap** and the **500-builds/month** budget — the two
+  limits that actually constrain a fleet this size.
+- [ ] Health-check cron for all sites; a single tracked list of the whole fleet.
+
+## Currency caveats: read this before you rely on anything above
+
+I built this section into the post on purpose, because a stack like this ages
+faster than most technical writing.
+
+- **Every quota here is time-sensitive.** These figures were each verified
+  against the provider's own official documentation at the time of writing, but
+  free tiers are changed by providers unilaterally and often without a
+  changelog. Cloudflare could lower the Pages project cap; Vercel could re-price
+  Hobby; Netlify's credits model could shift again. **Re-verify each number
+  against the linked official docs before you build on it.**
+- **Some limits I could not pin down, and I said so.** Netlify's free tier moved
+  to an opaque credits model and no longer publishes the concrete
+  bandwidth/build/site numbers I'd want to plan a fleet around. I did not
+  fabricate those numbers. Where a limit is unverifiable, treat it as a risk, not
+  a known quantity.
+- **The Astro Cloudflare adapter change is a live example** of exactly this kind
+  of drift — the Pages target was deprecated in favor of Workers. Assume other
+  such shifts will happen and check the current docs.
+- **This is general engineering information, not a support contract.** Free tiers
+  come with best-effort support and no SLA. If a site *must* be up, a ₹0 stack is
+  the wrong tool — pay for the guarantee. This architecture is for a portfolio of
+  independent, individually-non-critical products, which is precisely what a solo
+  builder's family of sites usually is.
+
+## Conclusion
+
+The reason I can run eighty-plus sites for zero rupees is not a secret coupon or
+a grandfathered plan. It is an architecture: static-first sites on Cloudflare
+Pages' unmetered free hosting, thin Cloudflare Workers for the genuinely dynamic
+bits, GitHub Actions as both build system and git-as-DB engine, keyless AI, and
+shared code behind distinct identities. Each layer is chosen so that idle costs
+nothing and usage stays inside a free allowance.
+
+The honest limits are real: the **100-project cap** on Cloudflare Pages is the
+ceiling I am walking toward, the **500-builds/month** budget disciplines how I
+ship, and the **10 ms Worker CPU** limit forces heavy work off the request path.
+None of those are dealbreakers for a family of small products; all of them would
+be for one big always-on app. That's the whole trade.
+
+If you take one thing from this post, take the mindset, not the exact numbers —
+because the numbers will change. Design for the free tier, push work to build
+time or off the request path, use git as your database, and keep your sites
+small and static. Then go re-verify every quota below before you build.
+
+## Sources and further reading
+
+Every limit above should be checked against these primary sources before you rely
+on it — they are the providers' own docs, and they are what these numbers were
+verified against.
+
+- Cloudflare Workers — platform limits and pricing (100k requests/day, 10 ms
+  CPU on free, Error 1027): [developers.cloudflare.com/workers/platform/limits](https://developers.cloudflare.com/workers/platform/limits/)
+  and [developers.cloudflare.com/workers/platform/pricing](https://developers.cloudflare.com/workers/platform/pricing/)
+- Cloudflare Pages — platform limits (unlimited requests/bandwidth, 500
+  builds/mo, 1 concurrent build, 20-min timeout, 100 projects/account, 100 custom
+  domains/project): [developers.cloudflare.com/pages/platform/limits](https://developers.cloudflare.com/pages/platform/limits/)
+- Vercel — limits (100 deploys/day, 100 GB Fast Data Transfer/mo, 1M function
+  invocations, 4 CPU-hrs, 360 GB-hrs): [vercel.com/docs/limits](https://vercel.com/docs/limits)
+- Netlify — pricing and the credits-based free tier: [netlify.com/pricing](https://www.netlify.com/pricing/)
+- Astro — islands architecture (zero client JS by default): [docs.astro.build/en/concepts/islands](https://docs.astro.build/en/concepts/islands/)
+- Astro Cloudflare adapter — current guidance (Pages support removed, directs to
+  Workers): [docs.astro.build/en/guides/integrations-guide/cloudflare](https://docs.astro.build/en/guides/integrations-guide/cloudflare/)
+- GitHub Actions — billing and usage (free minutes for public repositories): [docs.github.com/en/billing/managing-billing-for-github-actions](https://docs.github.com/en/billing/managing-billing-for-github-actions/about-billing-for-github-actions)
+- Simon Willison — "git scraping" technique: [simonwillison.net/2020/Oct/9/git-scraping](https://simonwillison.net/2020/Oct/9/git-scraping/)
+- gpt4free `g4f.dev` — keyless browser AI client: [github.com/xtekky/gpt4free](https://github.com/xtekky/gpt4free)
+
+*All quotas are 2026 figures and time-sensitive. Providers change free tiers
+without notice; re-verify against the official docs before relying on any number
+here. General engineering information, not a recommendation or a support
+guarantee.*
