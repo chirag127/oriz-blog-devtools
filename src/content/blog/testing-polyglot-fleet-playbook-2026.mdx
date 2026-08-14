@@ -1,0 +1,134 @@
+---
+title: "Testing a polyglot fleet: the 2026 per-stack playbook (Astro, Python, TS, MCP)"
+description: "How one solo developer adds real tests to every repo across Astro island sites, Python scrapers, TypeScript npm packages, and MCP servers — the exact frameworks, patterns, and CI wiring, with primary sources for every claim."
+pubDate: 2026-08-14
+category: "Testing"
+tags: ["testing", "vitest", "pytest", "astro", "mcp", "github-actions", "ci", "solo-developer", "property-based-testing"]
+author: "Chirag Singhal"
+---
+
+When you run a lot of small repos across several languages, "add tests" stops being one decision and becomes dozens of small ones — a different runner, a different mocking story, a different definition of "what's even worth testing" per stack. This is the playbook I settled on in 2026 for a polyglot fleet: Astro island sites on Cloudflare Pages, Python scrapers and data pipelines, TypeScript npm packages, and MCP servers. Every framework recommendation below is from a primary source (linked at the end); where something is version-gated or genuinely uncertain, I say so.
+
+The one principle that ties it together: **stack-native tooling, wired into GitHub Actions, gating merges on green CI.** Don't fight each ecosystem's grain. Use the runner its own maintainers use.
+
+## The short version
+
+| Stack | Runner | The key move |
+|---|---|---|
+| Astro + islands | **Vitest** (+ Astro Container API) | Render `.astro` and islands server-side, no browser. Playwright only for real hydration. |
+| Python scrapers/pipelines | **pytest** + HTTP mocking | Never hit live sites: `responses` (requests), `respx` (httpx), or VCR.py cassettes. |
+| TS npm packages | **Vitest** (+ type tests) | `expectTypeOf`/`assertType`, and `@arethetypeswrong/cli` for dual ESM+CJS builds. |
+| MCP servers | **MCP Inspector CLI** | Script `tools/list` / `tools/call` in CI across stdio + Streamable HTTP. |
+| All of them | **GitHub Actions** | Matrix + branch protection requiring green before merge. |
+
+## 1. Astro sites with Preact/React islands
+
+The breakthrough that makes island testing cheap is the **Astro Container API**, stable since **astro@4.9.0** (pin/verify your version — it graduated from experimental in the 5.x line). It renders `.astro` components *in isolation, server-side*, inside Vitest — no browser needed.
+
+Set Vitest up with Astro's own `getViteConfig()` helper so your aliases, plugins, and env just work:
+
+```ts
+// vitest.config.ts
+import { getViteConfig } from 'astro/config'
+export default getViteConfig({ test: { /* ... */ } })
+```
+
+Then render components with the Container API. It exposes two methods — `renderToString()` (HTML text) and `renderToResponse()` (a standard `Response`) — and supports slots:
+
+```ts
+import { experimental_AstroContainer as AstroContainer } from 'astro/container'
+import Card from '../src/components/Card.astro'
+
+const container = await AstroContainer.create()
+const html = await container.renderToString(Card, {
+  slots: { default: 'Card content' },
+})
+```
+
+Framework islands (React/Preact/Vue/Svelte) render via `getContainerRenderer()` from each framework's `container-renderer` entrypoint (e.g. `@astrojs/react/container-renderer`).
+
+**The honest limit:** the Container API renders *static output only*. It proves your component produces the right HTML — it does **not** exercise hydrated, interactive client behavior. For that you still need a real browser via **Playwright**. So the split is:
+
+- **Vitest + Container API** → does the island render the right markup for these props/slots? (fast, most of your tests)
+- **Preact/React Testing Library** → user-centric DOM tests for island logic. Its guiding principle, verbatim: *"The more your tests resemble the way your software is used, the more confidence they can give you."* Test behavior, not implementation.
+- **Playwright** → does the hydrated thing actually work when a user clicks it? (few, high-value)
+
+## 2. Python scrapers, pipelines, and CLIs
+
+pytest is the runner — plain `assert` with rich introspection, and fixtures for setup/teardown. The decision that matters for a *scraper* fleet is HTTP mocking, and the right library is chosen **by which HTTP client you use**:
+
+- **`requests`** → **`responses`**. Mocks out `requests`, and — critically for scrapers — raises `ConnectionError` on any URL you didn't explicitly mock. That turns "my test accidentally hit the live site" into a hard failure.
+- **`httpx`** → **RESPX**. Route matching, response side effects, call verification (`assert route.called`). Integrates via a `respx_mock` fixture and a `@pytest.mark.respx(base_url=...)` marker.
+- **Either, record/replay** → **VCR.py**. Records real HTTP interactions once to a YAML "cassette," then replays them so *"the requests will not actually result in HTTP traffic"* — giving you offline, deterministic, faster tests.
+
+Rule of thumb: mock with `responses`/`respx` when you want to *assert* on the request; use VCR.py cassettes when you want a realistic recorded response you don't want to hand-write.
+
+For **parsers**, golden/snapshot tests earn their keep: capture a known-good parse of a fixed input, then fail if the output drifts. For **money-handling logic** (my finance repos), test the invariants that actually bite: `Decimal` precision, rounding direction, and that no float sneaks into a currency path. (This is judgement from building it, not a cited claim — the research flagged money-handling patterns as under-covered in the sources.)
+
+## 3. TypeScript / JavaScript npm packages
+
+**Vitest** again — it reads your existing `vite.config`, so plugins and settings apply to tests without duplication. Two things packages need that apps don't:
+
+**Type-level tests.** Vitest supports these via `expectTypeOf` (fluent, built on the `expect-type` library) and `assertType`, enabled with the `--typecheck` flag. If your package's *types* are part of its contract, test them like any other behavior.
+
+**Dual-build validation.** If you ship both ESM and CJS, run **`@arethetypeswrong/cli`** in CI. It analyzes published package contents for TypeScript type-resolution problems — checking `node10`, `node16`, and `bundler` resolution modes, catching the "Masquerading as CJS/ESM" class of bug that only shows up *after* publish. This is the de-facto standard for validating dual-module builds.
+
+## 4. MCP servers
+
+Test against the protocol, using the official tool. The **MCP Inspector** (`@modelcontextprotocol/inspector`) is the reference dev tool; it ships three clients (Web UI, CLI, TUI) behind one binary. The **CLI client is scriptable and machine-readable** — built for CI:
+
+```bash
+# list tools
+npx @modelcontextprotocol/inspector --cli node build/server.js --method tools/list
+# call a tool
+npx @modelcontextprotocol/inspector --cli node build/server.js \
+  --method tools/call --tool-name my_tool --tool-arg key=value
+```
+
+MCP defines exactly **two standard transports**: **stdio** (newline-delimited JSON-RPC over a subprocess's standard streams) and **Streamable HTTP** (HTTP POST to a single endpoint; reply as a JSON object or a request-scoped SSE stream). The Inspector connects to both — local stdio by launch command, remote via `--server-url https://... --transport http`.
+
+Because *protocol semantics are identical on every transport*, most tool-call logic can be tested **once**, transport-agnostically. The one caveat (this inference was the report's only non-unanimous vote, 2-1): framing, cancellation mechanics, and request metadata **do** differ per binding — so keep a small set of transport-specific tests for those. The official MCP TypeScript SDK itself uses Vitest, which is a reasonable signal for your own tool-call unit tests.
+
+## 5. CI wiring (GitHub Actions)
+
+The primitives are stable and boring, which is exactly what you want:
+
+- **Matrix** for polyglot/OS/version coverage — a Cartesian product, e.g. `version: [20, 22] × os: [ubuntu, windows]` → 4 jobs.
+- **`on: pull_request`** already fires on the default activity types (`opened`, `synchronize`, `reopened`) — no extra config to run tests on every PR push.
+- **Branch protection** requiring status checks to pass before merge — this is what actually *gates* bad code out of `main`.
+- **`actions/cache`**, scoped by key/version/branch, with the default-branch cache shared to other branches and PRs — so deps don't reinstall from scratch every run.
+- **Flaky tests:** `gh run rerun RUN_ID --failed` re-runs only the failed jobs. Use it for transient failures — but a test that *needs* reruns is a bug report, not a retry candidate.
+- **Coverage gates:** the `vitest-coverage-report` action reads thresholds straight from your `coverage.thresholds` config and fails the check when you drop below them.
+
+## 6. How much, and what not to over-test
+
+Two well-worn models, and they don't fully agree:
+
+- **The Pyramid** (Fowler): many fast unit tests, fewer integration, very few end-to-end. The higher the level, the fewer.
+- **The Trophy** (Kent C. Dodds): static analysis (types + lint) at the base, then unit, a **wide integration band**, then a little e2e — because integration tests give the best confidence-per-effort.
+
+For a solo fleet, the Trophy fits better: your types and linter are free tests you already run, and integration tests catch the wiring bugs that actually break sites. On coverage: returns diminish sharply past **~70%** — chasing 100% is mostly self-harm on application code. Test the logic that would cost you money or data if it broke; don't test framework glue or getters.
+
+Two power tools for the parts that matter most:
+
+- **Property-based testing** — **Hypothesis** (Python) and **fast-check** (TS/JS). You describe the input space; the framework generates cases and *shrinks* failures to a minimal reproducer. Perfect for parsers, money math, and anything with invariants.
+- **Mutation testing** (mutmut / Stryker) — measures whether your tests would actually *catch* a bug, not just execute the line. Reserve it for critical modules; it's slow.
+
+And the 2026-specific trap: **AI-generated tests that assert current behavior rather than correct behavior.** A generated test that passes against a buggy function just locks the bug in. Read every generated assertion and ask "is this what it *should* do?" — not "does this pass?"
+
+## The order I'm rolling it out
+
+Not every repo at once. Value-first:
+
+1. **Money/data repos** (auto-investor, screener, finance tools) — property tests on the math, mocked-HTTP tests on the scrapers. Highest cost-of-failure.
+2. **Shared packages** — everything downstream depends on them; type + contract tests here protect the whole fleet.
+3. **MCP servers** — Inspector conformance in CI so a protocol regression can't ship.
+4. **Sites** — Container-API render tests + a Playwright smoke test per site.
+
+Then branch protection on `main` for each, so green-before-merge becomes the default and stays that way.
+
+---
+
+*Sources (all primary/canonical): [Astro Testing](https://docs.astro.build/en/guides/testing/) · [Astro Container API](https://docs.astro.build/en/reference/container-reference/) · [Preact Testing Library](https://testing-library.com/docs/preact-testing-library/intro/) · [responses](https://github.com/getsentry/responses) · [RESPX](https://lundberg.github.io/respx/) · [VCR.py](https://vcrpy.readthedocs.io/en/latest/) · [Vitest type testing](https://vitest.dev/guide/testing-types.html) · [are-the-types-wrong](https://github.com/arethetypeswrong/arethetypeswrong.github.io) · [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector) · [MCP transports](https://modelcontextprotocol.io/docs/concepts/transports) · [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) · [GHA matrix](https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs) · [Testing Trophy](https://kentcdodds.com/blog/the-testing-trophy-and-testing-classifications) · [Test Pyramid](https://martinfowler.com/articles/practical-test-pyramid.html) · [Hypothesis](https://hypothesis.readthedocs.io/en/latest/) · [fast-check](https://github.com/dubzzz/fast-check).*
+
+*This is a working playbook, not investment or security advice. Version-gated: the Astro Container API requires astro@4.9.0+; MCP details track spec revision 2026-07-28 — re-verify against your installed versions.*
