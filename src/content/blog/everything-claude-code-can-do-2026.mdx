@@ -1,0 +1,80 @@
+---
+title: "Everything Claude Code can do in 2026 — MCP, subagents, hooks, and what to build"
+description: "A cited field guide to Claude Code's 2026 capability stack — the five surfaces, MCP (transports, scopes, OAuth), subagents, the five-type hook system, skills, agent teams — plus the MCP servers worth connecting and a ranked list of projects to build with them."
+pubDate: 2026-08-14
+category: "AI Tooling"
+tags: ["claude-code", "mcp", "ai-agents", "subagents", "hooks", "automation", "devtools", "anthropic"]
+author: "Chirag Singhal"
+---
+
+Claude Code stopped being "an AI that edits files in your terminal" a while ago. In 2026 it's an agentic runtime with a real capability stack — a protocol for wiring in external systems, isolated subagents, a lifecycle hook system, skills, and multi-agent orchestration. This is a field guide to what it can actually do, and what's worth building on top of it. Every capability below is from primary sources (Anthropic docs, modelcontextprotocol.io, the GitHub/Microsoft server repos) — linked at the end.
+
+## The five surfaces, one engine
+
+Claude Code runs on **five surfaces**: the terminal CLI, the VS Code extension, the JetBrains extension, a standalone desktop app, and the web. They all share **one engine** — so your `CLAUDE.md` files, settings, and MCP servers work identically across every surface. Set something up once; it follows you everywhere.
+
+## MCP — the wiring
+
+The **Model Context Protocol (MCP)** is the open standard that lets Claude Code reach external systems: **data sources** (local files, databases), **tools** (search, calculators, APIs), and **workflows** (specialized prompts). It's how Claude reads a Google Drive doc, updates a Jira ticket, pulls Slack data, or drives your own custom tooling.
+
+What's worth knowing to use it well:
+
+- **Four transports:** remote **HTTP** (recommended), remote SSE (deprecated), local **stdio**, and remote WebSocket. HTTP supports OAuth and the `--transport` flag; WebSocket supports neither.
+- **Three config scopes:** `local` (this project, `~/.claude.json`), `project` (team-shared via a version-controlled `.mcp.json`), and `user` (all your projects, private). Managed-settings keys (`allowedMcpServers`, `deniedMcpServers`, `allowManagedMcpServersOnly`, `disabledMcpjsonServers`) gate which servers may connect — `deniedMcpServers` wins, and an empty allowlist means lockdown.
+- **OAuth 2.0** for remote servers — tokens stored securely and auto-refreshed, initiated via `/mcp` or (v2.1.186+) `claude mcp login <name>`.
+- **Adding one is one line:** `claude mcp add --transport http notion https://mcp.notion.com/mcp`.
+
+## Subagents — isolated context, scoped tools
+
+A **subagent runs in its own separate context window** with a custom system prompt, specific tool access, and independent permissions. It does verbose work off to the side and returns only a summary — keeping your main conversation clean.
+
+They're defined as **Markdown files with YAML frontmatter** in `.claude/agents/` (project) or `~/.claude/agents/` (user). Frontmatter fields include `name`, `description`, `tools`, `model`, `permissionMode`, `mcpServers`, `hooks`, `skills`, `memory`, and `isolation`. The powerful bit: via `mcpServers` you can scope a subagent **its own MCP servers** — even inline definitions connected only for that subagent's lifetime — so those tool descriptions never bloat the main context.
+
+## Hooks — deterministic policy
+
+**Hooks** are user-defined shell commands, HTTP endpoints, or LLM prompts that fire automatically at lifecycle points. Five handler types (`command`, `http`, `mcp_tool`, `prompt`, `agent`) fire on events including `PreToolUse`, `PostToolUse`, `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`, `PostCompact` (and more).
+
+The killer use is **enforcement**: a `PreToolUse` hook can **block a tool call** by exiting with code 2 or returning JSON with `permissionDecision: "deny"` — e.g. a `block-rm.sh` that greps for `rm -rf` and refuses it. Hooks are themselves governable via `allowedHttpHookUrls`, `allowManagedHooksOnly`, and `disableAllHooks`.
+
+## Skills (which now absorb slash commands)
+
+Custom **slash commands have merged into skills**. A file at `.claude/commands/deploy.md` and a skill at `.claude/skills/deploy/SKILL.md` both create `/deploy` and work identically — and your existing `.claude/commands/` files keep working. Skills can inject dynamic context (including from shell commands) so `/deploy` can carry your actual, current deploy steps rather than a static blob.
+
+## Orchestration — teams, background agents, the SDK
+
+- **Multiple agents in parallel** on different parts of a task, coordinated by a lead agent.
+- **Background agents** — run several full sessions at once, watched from one screen.
+- **The Agent SDK** — build fully custom agents with your own orchestration, tool access, and permissions.
+
+This is the layer that turns "an assistant" into "a fleet you dispatch."
+
+## The MCP servers worth connecting (2026)
+
+The two verified standouts, both official:
+
+- **GitHub's official MCP server** — repos, issues/PRs, code analysis, workflow automation. If your work lives on GitHub, this is the first one to add.
+- **Microsoft's Playwright MCP server** — browser automation via the **accessibility tree**, so it needs **no vision model**; install with a single `claude mcp add`. This is what lets Claude reliably click, fill forms, and scrape JS-rendered pages.
+
+Beyond those, the commonly-used reference/community servers cover **filesystem, git, fetch, memory, sequential-thinking, databases (Postgres/SQLite), and search** — plus domain servers (Notion, Figma, Slack, Jira). The rule of thumb: connect a server when the task genuinely needs that system, and scope credential-bearing ones tightly (project or subagent scope, OAuth where available).
+
+## What to build with it — ranked
+
+Generic, broadly useful:
+
+1. **Repo/PR automation bot** (GitHub MCP) — triage issues, review diffs, keep changelogs.
+2. **Browser data-pipeline** (Playwright MCP + cron) — scrape a JS site on a schedule, commit results.
+3. **A custom MCP server** for whatever system you own — turn an internal API into a Claude-usable tool.
+4. **Policy-enforced team setup** — hooks that block dangerous commands, skills that encode your deploy/runbook steps.
+
+And for the pattern I actually run — a **solo fleet of free static sites on Cloudflare Pages, git-as-database, keyless browser-side AI, GitHub Actions cron, and a live-market-data MCP** — the high-value builds are:
+
+5. **Live-data dashboards** — a market-data MCP → daily scrape → commit JSON → static site rebuilds. (This is exactly how the oriz finance trackers work: cron fires, data lands in `data/*.json`, the Astro site redeploys.)
+6. **Self-notifying monitors** — cron + a notifier (Telegram/ntfy), notify only on state change, dedup via the committed git-as-DB state.
+7. **Fleet-wide maintenance agents** — fan out subagents to add tests, fix CI, or standardize configs across dozens of repos in one pass (what built this very blog network).
+8. **A portfolio/analysis tool** on top of a connected finance MCP — allocation drift, concentration, rebalance nudges, entirely client-side and private.
+
+The throughline: MCP gives Claude the *reach* (systems), subagents give it *scale* (parallelism), hooks give it *safety* (enforcement), and cron gives it *autonomy* (it runs without you). Compose those four and you get software that maintains itself.
+
+---
+
+*Sources (primary): [Claude Code overview](https://docs.anthropic.com/en/docs/claude-code/overview) · [MCP in Claude Code](https://docs.anthropic.com/en/docs/claude-code/mcp) · [Subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) · [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) · [Settings](https://docs.anthropic.com/en/docs/claude-code/settings) · [Slash commands / skills](https://docs.anthropic.com/en/docs/claude-code/slash-commands) · [Best practices](https://www.anthropic.com/engineering/claude-code-best-practices) · [modelcontextprotocol.io](https://modelcontextprotocol.io/docs). Researched via a 105-agent adversarial-verification pass; all capability claims cited above passed unanimous (3-0) verification against these primary sources. Version-gated details (e.g. `claude mcp login` from v2.1.186) track the 2026 docs — re-check against your installed version.*
